@@ -1,12 +1,13 @@
 'use strict'
 
 const importer = require('ipfs-unixfs-importer')
+const toAsyncIterator = require('pull-stream-to-async-iterator')
+const toPullStream = require('async-iterator-to-pull-stream')
 const pull = require('pull-stream')
 const toPull = require('stream-to-pull-stream')
 const waterfall = require('async/waterfall')
 const isStream = require('is-stream')
 const isSource = require('is-pull-stream').isSource
-const CID = require('cids')
 const { parseChunkerString } = require('./utils')
 
 const WRAPPER = 'wrapper/'
@@ -16,19 +17,18 @@ function noop () {}
 function prepareFile (file, self, opts, callback) {
   opts = opts || {}
 
-  let cid = new CID(file.multihash)
-
-  if (opts.cidVersion === 1) {
-    cid = cid.toV1()
-  }
+  let cid = file.cid
 
   waterfall([
     (cb) => opts.onlyHash
       ? cb(null, file)
-      : self.object.get(file.multihash, Object.assign({}, opts, { preload: false }), cb),
+      : self.object.get(file.cid, Object.assign({}, opts, { preload: false }), cb),
     (node, cb) => {
-      const b58Hash = cid.toBaseEncodedString()
+      if (opts.cidVersion === 1) {
+        cid = cid.toV1()
+      }
 
+      const b58Hash = cid.toBaseEncodedString()
       let size = node.size
 
       if (Buffer.isBuffer(node)) {
@@ -36,10 +36,9 @@ function prepareFile (file, self, opts, callback) {
       }
 
       cb(null, {
-        path: opts.wrapWithDirectory
-          ? file.path.substring(WRAPPER.length)
-          : (file.path || b58Hash),
+        path: file.path === undefined ? b58Hash : (file.path || ''),
         hash: b58Hash,
+        // multihash: b58Hash,
         size
       })
     }
@@ -80,16 +79,16 @@ function normalizeContent (content, opts) {
       throw new Error('Must provide a path when wrapping with a directory')
     }
 
-    if (opts.wrapWithDirectory) {
-      data.path = WRAPPER + data.path
-    }
+    //if (opts.wrapWithDirectory) {
+    //  data.path = WRAPPER + data.path
+    //}
 
     return data
   })
 }
 
 function preloadFile (file, self, opts) {
-  const isRootFile = opts.wrapWithDirectory
+  const isRootFile = !file.path || opts.wrapWithDirectory
     ? file.path === ''
     : !file.path.includes('/')
 
@@ -130,7 +129,10 @@ module.exports = function (self) {
       shardSplitThreshold: self._options.EXPERIMENTAL.sharding
         ? 1000
         : Infinity
-    }, options, chunkerOptions)
+    }, options, {
+      ...chunkerOptions.chunkerOptions,
+      chunker: chunkerOptions.chunker
+    })
 
     // CID v0 is for multihashes encoded with sha2-256
     if (opts.hashAlg && opts.cidVersion !== 1) {
@@ -149,7 +151,11 @@ module.exports = function (self) {
     return pull(
       pull.map(content => normalizeContent(content, opts)),
       pull.flatten(),
-      importer(self._ipld, opts),
+      pull.map(file => ({
+        path: file.path ? file.path : undefined,
+        content: file.content ? toAsyncIterator(file.content) : undefined
+      })),
+      toPullStream.transform(source => importer(source, self._ipld, opts)),
       pull.asyncMap((file, cb) => prepareFile(file, self, opts, cb)),
       pull.map(file => preloadFile(file, self, opts)),
       pull.asyncMap((file, cb) => pinFile(file, self, opts, cb))
